@@ -85,3 +85,7 @@ linux/jucopy.py        — legacy polling implementation (no eBPF, no root)
 chrome/content.js      — browser extension entry point
 chrome/manifest.json   — MV3 manifest
 ```
+
+## Reply Language
+
+Just respond in Chinese. Do not use English if i not specifically requested.
