@@ -1,10 +1,32 @@
 # jucopy
 
-**jucopy** uses eBPF to make text selection on Ubuntu 24.04 desktop behave like
-a real "copy": whatever you highlight with the mouse is immediately available
-for `Ctrl+V` paste — no need to press `Ctrl+C` first.
+Just copy it while it is selected.
 
-## How it works
+Automatically copies selected text to the clipboard — no extra key press needed.
+
+---
+
+## Chrome Extension (`chrome/`)
+
+### Installation
+
+1. Go to `chrome://extensions/` in your Chrome browser
+2. Enable **Developer mode** (toggle in the top right)
+3. Click **Load unpacked** and select the `chrome/` directory
+
+### Usage
+
+Once installed, any text you select on any webpage is automatically copied to your clipboard.
+
+---
+
+## Linux Desktop — Ubuntu 24.04 (eBPF)
+
+**jucopy** uses eBPF to make text selection behave like a real "copy": whatever
+you highlight with the mouse is immediately available for `Ctrl+V` paste —
+no need to press `Ctrl+C` first.
+
+### How it works
 
 On Linux, selecting text places it in the **PRIMARY** selection (paste with
 middle-click) but *not* in the **CLIPBOARD** (paste with `Ctrl+V`).
@@ -29,7 +51,7 @@ jucopy user-space handler
       └─────── xclip -selection clipboard
 ```
 
-## Requirements
+### Requirements
 
 | Dependency | Package (apt) | Purpose |
 |---|---|---|
@@ -40,7 +62,7 @@ jucopy user-space handler
 | xsel *(optional)* | `xsel` | Alternative clipboard tool |
 | wl-clipboard *(optional)* | `wl-clipboard` | Wayland PRIMARY sync |
 
-## Quick start
+### Quick start
 
 ```bash
 # Install dependencies
@@ -57,7 +79,7 @@ sudo bash install.sh
 sudo jucopy
 ```
 
-## Usage
+### Usage
 
 ```
 sudo python3 jucopy.py [--display DISPLAY] [--verbose]
@@ -67,14 +89,14 @@ Options:
   -v, --verbose      Print each sync event
 ```
 
-## Run as a service
+### Run as a service
 
 ```bash
 sudo bash install.sh          # installs to /usr/local/bin and /etc/systemd/system/
 sudo systemctl enable --now jucopy
 ```
 
-## Wayland
+### Wayland
 
 For **XWayland** apps (most apps on Ubuntu 24.04 Wayland sessions), jucopy
 works transparently because they still call `XSetSelectionOwner()`.
@@ -82,7 +104,7 @@ works transparently because they still call `XSetSelectionOwner()`.
 For fully **Wayland-native** apps, jucopy falls back to `wl-paste`/`wl-copy`
 from the `wl-clipboard` package if it is installed.
 
-## Troubleshooting
+### Troubleshooting
 
 | Symptom | Fix |
 |---|---|
@@ -90,3 +112,4 @@ from the `wl-clipboard` package if it is installed.
 | `Error: libX11.so.6 not found` | `sudo apt install libx11-6` |
 | Clipboard not syncing | Install `xclip`: `sudo apt install xclip` |
 | Permission denied | Run with `sudo` |
+

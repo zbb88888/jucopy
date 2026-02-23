@@ -1,0 +1,13 @@
+{
+  "manifest_version": 3,
+  "name": "jucopy",
+  "version": "1.0.0",
+  "description": "Just copy it while it is selected",
+  "permissions": ["clipboardWrite"],
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"]
+    }
+  ]
+}
