@@ -20,7 +20,7 @@ Once installed, any text you select on any webpage is automatically copied to yo
 
 ---
 
-## Linux Desktop — Ubuntu 24.04 (eBPF)
+## Linux Desktop — Ubuntu 24.04 (`linux-desk/`, eBPF)
 
 **jucopy** uses eBPF to make text selection behave like a real "copy": whatever
 you highlight with the mouse is immediately available for `Ctrl+V` paste —
@@ -69,28 +69,20 @@ jucopy user-space handler
 sudo apt install python3-bpfcc libx11-6 xclip
 
 # Run (requires root to load eBPF programs)
-sudo python3 jucopy.py
+sudo python3 linux-desk/jucopy.py
 ```
 
 Or use the installer:
 
 ```bash
-sudo bash install.sh
+sudo bash linux-desk/install.sh
 sudo jucopy
-## Linux Desktop (`linux/`) — Ubuntu 24.04
-
-Monitors the X11 primary selection and syncs it to the clipboard whenever it changes.
-
-### Requirements
-
-```bash
-sudo apt install xclip
 ```
 
 ### Usage
 
 ```
-sudo python3 jucopy.py [--display DISPLAY] [--verbose]
+sudo python3 linux-desk/jucopy.py [--display DISPLAY] [--verbose]
 
 Options:
   --display DISPLAY  X11 display (default: $DISPLAY or :0)
@@ -100,7 +92,7 @@ Options:
 ### Run as a service
 
 ```bash
-sudo bash install.sh          # installs to /usr/local/bin and /etc/systemd/system/
+sudo bash linux-desk/install.sh   # installs to /usr/local/bin and /etc/systemd/system/
 sudo systemctl enable --now jucopy
 ```
 
@@ -121,10 +113,3 @@ from the `wl-clipboard` package if it is installed.
 | Clipboard not syncing | Install `xclip`: `sudo apt install xclip` |
 | Permission denied | Run with `sudo` |
 
-```bash
-python3 linux/jucopy.py
-```
-
-### Run at startup
-
-Add the command above to your desktop session **Startup Applications** so it runs automatically when you log in.
