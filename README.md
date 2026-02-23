@@ -113,3 +113,18 @@ from the `wl-clipboard` package if it is installed.
 | Clipboard not syncing | Install `xclip`: `sudo apt install xclip` |
 | Permission denied | Run with `sudo` |
 
+### 内核态过滤器与反馈循环防护
+
+- eBPF 程序新增 `is_sync_tool()` 内联函数，过滤 xclip / xsel / wl-copy / wl-paste 的反馈循环
+- 通过逐字节比较进程名实现，兼容内核版本 ≥ 4.14
+
+### 自动修复 XAUTHORITY
+
+- `sudo` 环境下自动定位 `~/.Xauthority` 或 `/run/user/<uid>/xauth_*`
+- 确保 `xclip` 在无 DISPLAY 的情况下正常工作
+
+### libX11 动态解析
+
+- 优先通过 `/proc/*/maps` 扫描运行中的 X11 进程，获取真实路径
+- 兼容非标准安装路径（如 Flatpak、Snap、自定义 LD_LIBRARY_PATH）
+

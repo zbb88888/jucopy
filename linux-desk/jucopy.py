@@ -10,14 +10,18 @@ with Ctrl+V.
 
 Architecture
 ------------
-  eBPF uprobe (kernel)          User-space
-  ┌──────────────────┐    ┌─────────────────────────────┐
-  │ XSetSelectionOwner│    │  ring-buffer callback       │
-  │   ↓               │    │    ↓ (non-blocking put)     │
-  │ filter XA_PRIMARY │───>│  Queue ──> sync_worker thr  │
-  │ ringbuf_submit()  │    │              ↓               │
-  └──────────────────┘    │     xclip/xsel/wl-copy      │
-                           └─────────────────────────────┘
+  eBPF uprobe (kernel)                 User-space
+  ┌───────────────────────┐    ┌─────────────────────────────┐
+  │ XSetSelectionOwner    │    │  ring-buffer callback       │
+  │   ↓                   │    │    ↓ (non-blocking put)     │
+  │ filter XA_PRIMARY     │───>│  Queue ──> sync_worker thr  │
+  │ filter sync-tool comm │    │              ↓               │
+  │ ringbuf_submit()      │    │     xclip/xsel/wl-copy      │
+  └───────────────────────┘    └─────────────────────────────┘
+
+  The comm filter in eBPF prevents the feedback loop where xclip/xsel's own
+  XSetSelectionOwner(PRIMARY) call would re-trigger a sync, which could cause
+  a runaway CPU spike with non-conforming clipboard managers.
 
 Requirements
 ------------
@@ -87,6 +91,41 @@ struct event_t {
 BPF_RINGBUF_OUTPUT(selection_events, RINGBUF_PAGES_PLACEHOLDER);
 
 /*
+ * Return 1 if the current task's comm matches a known clipboard sync tool.
+ *
+ * Filtering in kernel space prevents the feedback loop where xclip / xsel's
+ * own XSetSelectionOwner(PRIMARY) call re-triggers a sync.  Without this,
+ * a non-conforming clipboard manager that writes PRIMARY on every CLIPBOARD
+ * update can cause a busy-loop that pegs CPU.
+ *
+ * We use explicit byte comparisons rather than bpf_strncmp() because the
+ * latter is only available on kernel >= 5.17, and we want this to compile
+ * all the way back to the perf-buffer fallback target (< 5.8).
+ */
+static __always_inline int is_sync_tool(char comm[16])
+{
+    /* xclip */
+    if (comm[0]=='x' && comm[1]=='c' && comm[2]=='l' &&
+        comm[3]=='i' && comm[4]=='p' && comm[5]=='\0')
+        return 1;
+    /* xsel */
+    if (comm[0]=='x' && comm[1]=='s' && comm[2]=='e' &&
+        comm[3]=='l' && comm[4]=='\0')
+        return 1;
+    /* wl-copy */
+    if (comm[0]=='w' && comm[1]=='l' && comm[2]=='-' &&
+        comm[3]=='c' && comm[4]=='o' && comm[5]=='p' &&
+        comm[6]=='y' && comm[7]=='\0')
+        return 1;
+    /* wl-paste */
+    if (comm[0]=='w' && comm[1]=='l' && comm[2]=='-' &&
+        comm[3]=='p' && comm[4]=='a' && comm[5]=='s' &&
+        comm[6]=='t' && comm[7]=='e' && comm[8]=='\0')
+        return 1;
+    return 0;
+}
+
+/*
  * uprobe on XSetSelectionOwner() – ring-buffer variant.
  *
  * Function signature:
@@ -100,12 +139,18 @@ int trace_xset_selection(struct pt_regs *ctx)
     if (selection != XA_PRIMARY_ATOM)
         return 0;
 
+    /* Reject events from our own sync tools to prevent feedback loops. */
+    char comm[16] = {};
+    bpf_get_current_comm(&comm, sizeof(comm));
+    if (is_sync_tool(comm))
+        return 0;
+
     struct event_t *event = selection_events.ringbuf_reserve(sizeof(struct event_t));
     if (!event)
         return 0;
 
     event->pid = bpf_get_current_pid_tgid() >> 32;
-    bpf_get_current_comm(&event->comm, sizeof(event->comm));
+    __builtin_memcpy(event->comm, comm, sizeof(event->comm));
 
     selection_events.ringbuf_submit(event, 0);
     return 0;
@@ -113,6 +158,7 @@ int trace_xset_selection(struct pt_regs *ctx)
 """
 
 # Legacy perf-buffer variant (kernel < 5.8 fallback).
+# Shares the same is_sync_tool() filter logic.
 BPF_TEXT_PERFBUF = r"""
 #include <uapi/linux/ptrace.h>
 
@@ -125,6 +171,25 @@ struct event_t {
 
 BPF_PERF_OUTPUT(selection_events);
 
+static __always_inline int is_sync_tool(char comm[16])
+{
+    if (comm[0]=='x' && comm[1]=='c' && comm[2]=='l' &&
+        comm[3]=='i' && comm[4]=='p' && comm[5]=='\0')
+        return 1;
+    if (comm[0]=='x' && comm[1]=='s' && comm[2]=='e' &&
+        comm[3]=='l' && comm[4]=='\0')
+        return 1;
+    if (comm[0]=='w' && comm[1]=='l' && comm[2]=='-' &&
+        comm[3]=='c' && comm[4]=='o' && comm[5]=='p' &&
+        comm[6]=='y' && comm[7]=='\0')
+        return 1;
+    if (comm[0]=='w' && comm[1]=='l' && comm[2]=='-' &&
+        comm[3]=='p' && comm[4]=='a' && comm[5]=='s' &&
+        comm[6]=='t' && comm[7]=='e' && comm[8]=='\0')
+        return 1;
+    return 0;
+}
+
 int trace_xset_selection(struct pt_regs *ctx)
 {
     unsigned long selection = PT_REGS_PARM2(ctx);
@@ -132,9 +197,14 @@ int trace_xset_selection(struct pt_regs *ctx)
     if (selection != XA_PRIMARY_ATOM)
         return 0;
 
+    char comm[16] = {};
+    bpf_get_current_comm(&comm, sizeof(comm));
+    if (is_sync_tool(comm))
+        return 0;
+
     struct event_t event = {};
     event.pid = bpf_get_current_pid_tgid() >> 32;
-    bpf_get_current_comm(&event.comm, sizeof(event.comm));
+    __builtin_memcpy(event.comm, comm, sizeof(event.comm));
     selection_events.perf_submit(ctx, &event, sizeof(event));
     return 0;
 }
@@ -288,6 +358,62 @@ def resolve_primary_atom(display_env: Optional[str]) -> int:
         return FALLBACK
 
 
+def find_libx11_from_proc_maps(target_pid: Optional[int] = None) -> Optional[str]:
+    """
+    Discover libX11.so.6 by reading ``/proc/<pid>/maps`` of running processes.
+
+    Unlike ``ldconfig``-based discovery, this returns the *actual* path that
+    the dynamic linker resolved at load time for a live process, making it
+    robust to:
+
+    * Non-standard installation prefixes (``/opt``, ``/home/user/.local``, …)
+    * Flatpak / Snap container mounts
+    * Custom ``LD_LIBRARY_PATH`` overrides
+    * Stale or absent ``ldconfig`` cache
+
+    Parameters
+    ----------
+    target_pid:
+        If given, only ``/proc/<target_pid>/maps`` is inspected – useful when
+        the caller already knows the PID of the target X11 application.
+        If ``None`` (default), all accessible ``/proc/*/maps`` are scanned
+        and the first match is returned.
+
+    Returns
+    -------
+    str | None
+        Absolute path to ``libX11.so.6`` as mapped into a running process,
+        or ``None`` if no match was found.
+    """
+    soname = "libX11.so.6"
+
+    if target_pid is not None:
+        maps_files: list[str] = [f"/proc/{target_pid}/maps"]
+    else:
+        maps_files = glob.glob("/proc/[0-9]*/maps")
+
+    for maps_path in maps_files:
+        try:
+            with open(maps_path) as fh:
+                for line in fh:
+                    # /proc/<pid>/maps line format:
+                    #   addr-addr perms offset dev inode [pathname]
+                    # The optional pathname is field index 5.
+                    fields = line.split()
+                    if len(fields) < 6:
+                        continue
+                    path = fields[5]
+                    # Match both the versioned soname (libX11.so.6) and any
+                    # full version suffix (libX11.so.6.4.0).
+                    if soname in path and os.path.isfile(path):
+                        return path
+        except (PermissionError, OSError):
+            # Skip processes we cannot read (different user, already exited)
+            continue
+
+    return None
+
+
 def find_libx11() -> Optional[str]:
     """
     Return the absolute path of libX11.so.6 on this system.
@@ -295,7 +421,9 @@ def find_libx11() -> Optional[str]:
     Resolution order:
       1. ctypes.util.find_library (delegates to ldconfig / ld.so.conf)
       2. Hardcoded glob patterns (multiarch: x86_64, aarch64, etc.)
-      3. Explicit ldconfig -p parsing as last resort
+      3. /proc/*/maps scan – finds the library as loaded by live X11 processes
+         (survives non-standard prefixes, Flatpak, custom LD_LIBRARY_PATH)
+      4. Explicit ldconfig -p parsing as last resort
     """
     # --- 1. Standard library lookup (most portable) ---
     name = ctypes.util.find_library("X11")
@@ -328,7 +456,12 @@ def find_libx11() -> Optional[str]:
         if os.path.isfile(path):
             return path
 
-    # --- 3. Explicit ldconfig fallback ---
+    # --- 3. /proc/*/maps scan (live processes, non-standard prefixes) ---
+    proc_path = find_libx11_from_proc_maps()
+    if proc_path:
+        return proc_path
+
+    # --- 4. Explicit ldconfig fallback ---
     try:
         result = subprocess.run(
             ["ldconfig", "-p"], capture_output=True, text=True, timeout=5

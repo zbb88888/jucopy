@@ -39,6 +39,11 @@
 - `selection != XA_PRIMARY` 直接 `return 0`，避免无意义的 context switch
 - 仅 PRIMARY 变化才触发 `perf_submit`（包含 PID、进程名）
 
+### eBPF 内核态过滤器
+
+- 新增 `is_sync_tool()` 内联函数，过滤 xclip / xsel / wl-copy / wl-paste 的反馈循环
+- 通过逐字节比较进程名实现，兼容内核版本 ≥ 4.14
+
 ### 生产/消费解耦
 
 - 回调函数**不执行 subprocess**，仅往 `queue.Queue(maxsize=1)` 放信号
@@ -63,6 +68,16 @@
 
 - `sudo` 环境下 `DISPLAY` 经常为空，在 `main()` 入口显式检查并给出修复建议
 - 支持 `--display` 参数手动指定
+
+### 自动修复 XAUTHORITY
+
+- `sudo` 环境下自动定位 `~/.Xauthority` 或 `/run/user/<uid>/xauth_*`
+- 确保 `xclip` 在无 DISPLAY 的情况下正常工作
+
+### libX11 动态解析
+
+- 优先通过 `/proc/*/maps` 扫描运行中的 X11 进程，获取真实路径
+- 兼容非标准安装路径（如 Flatpak、Snap、自定义 LD_LIBRARY_PATH）
 
 ### 资源清理
 
