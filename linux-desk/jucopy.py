@@ -8,6 +8,17 @@ XSetSelectionOwner() inside libX11 to detect every selection change and
 immediately syncs PRIMARY -> CLIPBOARD, so selected text is also pasteable
 with Ctrl+V.
 
+Architecture
+------------
+  eBPF uprobe (kernel)          User-space
+  ┌──────────────────┐    ┌─────────────────────────────┐
+  │ XSetSelectionOwner│    │  perf-buffer callback       │
+  │   ↓               │    │    ↓ (non-blocking put)     │
+  │ filter XA_PRIMARY │───>│  Queue ──> sync_worker thr  │
+  │ perf_submit()     │    │              ↓               │
+  └──────────────────┘    │     xclip/xsel/wl-copy      │
+                           └─────────────────────────────┘
+
 Requirements
 ------------
   - Linux kernel >= 4.14 with eBPF support
@@ -22,17 +33,21 @@ Usage
 """
 
 import argparse
+import ctypes.util
 import glob
 import os
+import queue
 import subprocess
 import sys
+import threading
 import time
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-# Ignore duplicate selection events within this window (seconds).
+# Debounce window on the consumer side (seconds).
+# The sync worker sleeps this long after each sync to coalesce rapid events.
 DEBOUNCE_S = 0.05
 
 # Timeout for the perf-buffer poll loop (milliseconds).
@@ -44,6 +59,9 @@ POLL_TIMEOUT_MS = 100
 BPF_TEXT = r"""
 #include <uapi/linux/ptrace.h>
 
+/* X11 predefined Atom values (from <X11/Xatom.h>) */
+#define XA_PRIMARY  1
+
 struct event_t {
     u32 pid;
     char comm[16];
@@ -53,12 +71,25 @@ BPF_PERF_OUTPUT(selection_events);
 
 /*
  * uprobe attached to XSetSelectionOwner() in libX11.so.6.
- * Called by X11/XWayland clients whenever they claim ownership of a
- * selection (PRIMARY when the user finishes highlighting text, CLIPBOARD
- * when the user presses Ctrl+C, etc.).
+ *
+ * Function signature:
+ *   int XSetSelectionOwner(Display *display, Atom selection,
+ *                          Window owner, Time time);
+ *
+ * We only care about PRIMARY selection changes (Atom == 1).  Filtering
+ * in kernel space avoids unnecessary context switches for CLIPBOARD or
+ * other custom selections (e.g. SECONDARY, manager atoms).
  */
 int trace_xset_selection(struct pt_regs *ctx)
 {
+    /* 2nd argument: Atom selection.
+     * PT_REGS_PARM2 abstracts away register differences across
+     * architectures (x86_64: %rsi, aarch64: x1, etc.). */
+    unsigned long selection = PT_REGS_PARM2(ctx);
+
+    if (selection != XA_PRIMARY)
+        return 0;
+
     struct event_t event = {};
     event.pid = bpf_get_current_pid_tgid() >> 32;
     bpf_get_current_comm(&event.comm, sizeof(event.comm));
@@ -82,9 +113,48 @@ def check_root():
         sys.exit(1)
 
 
+def check_display(display_env):
+    """Warn early if no DISPLAY is reachable (common under bare sudo)."""
+    if not display_env:
+        print(
+            "Warning: DISPLAY is not set.  Under sudo the desktop session\n"
+            "environment is often lost.  Pass --display explicitly or use:\n"
+            "  sudo -E python3 jucopy.py\n"
+            "  sudo DISPLAY=:0 python3 jucopy.py",
+            file=sys.stderr,
+        )
+
+
 def find_libx11():
-    """Return the absolute path of libX11.so.6 on this system."""
-    # Common locations across x86-64, arm64, and multiarch layouts
+    """
+    Return the absolute path of libX11.so.6 on this system.
+
+    Resolution order:
+      1. ctypes.util.find_library (delegates to ldconfig / ld.so.conf)
+      2. Hardcoded glob patterns (multiarch: x86_64, aarch64, etc.)
+      3. Explicit ldconfig -p parsing as last resort
+    """
+    # --- 1. Standard library lookup (most portable) ---
+    name = ctypes.util.find_library("X11")
+    if name:
+        # find_library may return a bare soname like "libX11.so.6"; resolve
+        # to an absolute path via the dynamic linker search.
+        if os.path.isabs(name) and os.path.isfile(name):
+            return name
+        # Try to resolve soname → absolute path via ldconfig
+        try:
+            result = subprocess.run(
+                ["ldconfig", "-p"], capture_output=True, text=True, timeout=5
+            )
+            for line in result.stdout.splitlines():
+                if name in line and "=>" in line:
+                    path = line.split("=>")[1].strip()
+                    if os.path.isfile(path):
+                        return path
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
+
+    # --- 2. Hardcoded multiarch glob patterns ---
     candidates = (
         glob.glob("/usr/lib/x86_64-linux-gnu/libX11.so.6")
         + glob.glob("/usr/lib/aarch64-linux-gnu/libX11.so.6")
@@ -95,7 +165,7 @@ def find_libx11():
         if os.path.isfile(path):
             return path
 
-    # Fallback: ask ldconfig
+    # --- 3. Explicit ldconfig fallback ---
     try:
         result = subprocess.run(
             ["ldconfig", "-p"], capture_output=True, text=True, timeout=5
@@ -198,6 +268,34 @@ def sync_selection(display_env, verbose):
 
 
 # ---------------------------------------------------------------------------
+# Async sync worker (producer/consumer pattern)
+# ---------------------------------------------------------------------------
+
+def _sync_worker(sync_q, display_env, verbose):
+    """
+    Consumer thread: drains the queue and performs the actual clipboard sync.
+
+    Debouncing is done here on the consumer side so that rapid-fire events
+    are coalesced into a single subprocess invocation.
+    """
+    while True:
+        # Block until at least one event is available.
+        sync_q.get()
+
+        # Drain any queued duplicates before doing work.
+        while not sync_q.empty():
+            try:
+                sync_q.get_nowait()
+            except queue.Empty:
+                break
+
+        sync_selection(display_env, verbose)
+
+        # Post-sync debounce: sleep briefly so the next burst is coalesced.
+        time.sleep(DEBOUNCE_S)
+
+
+# ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
 
@@ -222,29 +320,43 @@ def run(libx11_path, display_env, verbose):
     if verbose:
         print(f"Attached eBPF uprobe to XSetSelectionOwner in {libx11_path}")
 
-    last_sync = 0.0
+    # --- Start async sync worker ---
+    # maxsize=1: we only need a "sync needed" signal; if the queue is full
+    # the previous signal hasn't been consumed yet, so we skip (coalesce).
+    sync_q = queue.Queue(maxsize=1)
+    worker = threading.Thread(
+        target=_sync_worker,
+        args=(sync_q, display_env, verbose),
+        daemon=True,
+        name="jucopy-sync-worker",
+    )
+    worker.start()
 
     def handle_event(cpu, data, size):
-        nonlocal last_sync
+        """Perf-buffer callback: enqueue a sync signal (non-blocking)."""
         event = b["selection_events"].event(data)
-        now = time.monotonic()
-        if now - last_sync < DEBOUNCE_S:
-            return
-        last_sync = now
-
         if verbose:
             comm = event.comm.decode("utf-8", errors="replace")
             print(f"Selection event: pid={event.pid} comm={comm!r}")
-
-        sync_selection(display_env, verbose)
+        try:
+            sync_q.put_nowait(True)
+        except queue.Full:
+            # Previous sync still pending — this event is coalesced.
+            pass
 
     b["selection_events"].open_perf_buffer(handle_event)
 
     print("jucopy is running – selected text is automatically copied to clipboard.")
     print("Press Ctrl+C to stop.\n")
 
-    while True:
-        b.perf_buffer_poll(timeout=POLL_TIMEOUT_MS)
+    try:
+        while True:
+            b.perf_buffer_poll(timeout=POLL_TIMEOUT_MS)
+    finally:
+        # Explicit cleanup: detach uprobe and free eBPF resources.
+        if verbose:
+            print("Detaching eBPF uprobe...")
+        b.cleanup()
 
 
 def main():
@@ -266,6 +378,7 @@ def main():
     args = parser.parse_args()
 
     check_root()
+    check_display(args.display)
 
     libx11 = find_libx11()
     if not libx11:
