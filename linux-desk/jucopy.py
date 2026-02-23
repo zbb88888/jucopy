@@ -12,16 +12,17 @@ Architecture
 ------------
   eBPF uprobe (kernel)          User-space
   ┌──────────────────┐    ┌─────────────────────────────┐
-  │ XSetSelectionOwner│    │  perf-buffer callback       │
+  │ XSetSelectionOwner│    │  ring-buffer callback       │
   │   ↓               │    │    ↓ (non-blocking put)     │
   │ filter XA_PRIMARY │───>│  Queue ──> sync_worker thr  │
-  │ perf_submit()     │    │              ↓               │
+  │ ringbuf_submit()  │    │              ↓               │
   └──────────────────┘    │     xclip/xsel/wl-copy      │
                            └─────────────────────────────┘
 
 Requirements
 ------------
-  - Linux kernel >= 4.14 with eBPF support
+  - Linux kernel >= 5.8 with eBPF ring-buffer support
+    (falls back to perf-buffer on older kernels automatically)
   - python3-bpfcc  (BCC Python bindings)
   - libx11-6       (libX11.so.6 must be present)
   - xclip OR xsel  (for X11 / XWayland)
@@ -33,6 +34,8 @@ Usage
 """
 
 import argparse
+import contextlib
+import ctypes
 import ctypes.util
 import glob
 import os
@@ -41,6 +44,7 @@ import subprocess
 import sys
 import threading
 import time
+from typing import Any, Optional
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -50,17 +54,69 @@ import time
 # The sync worker sleeps this long after each sync to coalesce rapid events.
 DEBOUNCE_S = 0.05
 
-# Timeout for the perf-buffer poll loop (milliseconds).
+# Timeout for the ring-buffer / perf-buffer poll loop (milliseconds).
 POLL_TIMEOUT_MS = 100
 
+# Ring-buffer size in pages (must be a power of 2, requires kernel >= 5.8).
+RINGBUF_PAGES = 8
+
+# Minimum kernel version that supports BPF_RINGBUF (5.8.0).
+RINGBUF_MIN_KERNEL = (5, 8, 0)
+
 # ---------------------------------------------------------------------------
-# eBPF program (compiled at runtime by BCC)
+# eBPF programs (compiled at runtime by BCC)
 # ---------------------------------------------------------------------------
-BPF_TEXT = r"""
+
+# Modern ring-buffer variant (kernel >= 5.8).
+# Advantages over perf-buffer:
+#   • Single shared memory pool → no per-CPU fragmentation
+#   • Global event ordering guaranteed
+#   • Lower overhead: no poll needed, wakeup-on-submit possible
+#
+# XA_PRIMARY_ATOM is replaced at runtime with the dynamically resolved value.
+BPF_TEXT_RINGBUF = r"""
 #include <uapi/linux/ptrace.h>
 
-/* X11 predefined Atom values (from <X11/Xatom.h>) */
-#define XA_PRIMARY  1
+#define XA_PRIMARY_ATOM  PRIMARY_ATOM_PLACEHOLDER
+
+struct event_t {
+    u32 pid;
+    char comm[16];
+};
+
+BPF_RINGBUF_OUTPUT(selection_events, RINGBUF_PAGES_PLACEHOLDER);
+
+/*
+ * uprobe on XSetSelectionOwner() – ring-buffer variant.
+ *
+ * Function signature:
+ *   int XSetSelectionOwner(Display *display, Atom selection,
+ *                          Window owner, Time time);
+ */
+int trace_xset_selection(struct pt_regs *ctx)
+{
+    unsigned long selection = PT_REGS_PARM2(ctx);
+
+    if (selection != XA_PRIMARY_ATOM)
+        return 0;
+
+    struct event_t *event = selection_events.ringbuf_reserve(sizeof(struct event_t));
+    if (!event)
+        return 0;
+
+    event->pid = bpf_get_current_pid_tgid() >> 32;
+    bpf_get_current_comm(&event->comm, sizeof(event->comm));
+
+    selection_events.ringbuf_submit(event, 0);
+    return 0;
+}
+"""
+
+# Legacy perf-buffer variant (kernel < 5.8 fallback).
+BPF_TEXT_PERFBUF = r"""
+#include <uapi/linux/ptrace.h>
+
+#define XA_PRIMARY_ATOM  PRIMARY_ATOM_PLACEHOLDER
 
 struct event_t {
     u32 pid;
@@ -69,25 +125,11 @@ struct event_t {
 
 BPF_PERF_OUTPUT(selection_events);
 
-/*
- * uprobe attached to XSetSelectionOwner() in libX11.so.6.
- *
- * Function signature:
- *   int XSetSelectionOwner(Display *display, Atom selection,
- *                          Window owner, Time time);
- *
- * We only care about PRIMARY selection changes (Atom == 1).  Filtering
- * in kernel space avoids unnecessary context switches for CLIPBOARD or
- * other custom selections (e.g. SECONDARY, manager atoms).
- */
 int trace_xset_selection(struct pt_regs *ctx)
 {
-    /* 2nd argument: Atom selection.
-     * PT_REGS_PARM2 abstracts away register differences across
-     * architectures (x86_64: %rsi, aarch64: x1, etc.). */
     unsigned long selection = PT_REGS_PARM2(ctx);
 
-    if (selection != XA_PRIMARY)
+    if (selection != XA_PRIMARY_ATOM)
         return 0;
 
     struct event_t event = {};
@@ -102,7 +144,7 @@ int trace_xset_selection(struct pt_regs *ctx)
 # Helpers
 # ---------------------------------------------------------------------------
 
-def check_root():
+def check_root() -> None:
     """eBPF uprobes require CAP_SYS_ADMIN (root) on most kernels."""
     if os.geteuid() != 0:
         print(
@@ -113,7 +155,7 @@ def check_root():
         sys.exit(1)
 
 
-def check_display(display_env):
+def check_display(display_env: Optional[str]) -> None:
     """Warn early if no DISPLAY is reachable (common under bare sudo)."""
     if not display_env:
         print(
@@ -125,7 +167,128 @@ def check_display(display_env):
         )
 
 
-def find_libx11():
+def check_x11_environment() -> None:
+    """
+    Exit early with a clear message when no X11 runtime is present.
+
+    This protects headless nodes (e.g. servers without a GPU/display)
+    from a confusing BCC/libX11 traceback.
+    """
+    if not find_libx11():
+        print(
+            "Error: libX11.so.6 not found.  This host appears to be headless\n"
+            "or X11 libraries are not installed.  jucopy requires an X11\n"
+            "desktop environment to function.\n"
+            "Install with:  sudo apt install libx11-6",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
+def setup_xauth() -> None:
+    """
+    Automatically fix missing X11 authorisation when running under sudo.
+
+    Under plain ``sudo``, the XAUTHORITY variable is typically lost, causing
+    X11 clients to fail with ``No protocol specified``.  This function probes
+    common locations for the real user's Xauthority file and sets the
+    environment variable before any X11 subprocess is spawned.
+
+    Resolution order:
+      1. XAUTHORITY already set → nothing to do.
+      2. $HOME/.Xauthority of the real (SUDO_USER) user.
+      3. First matching xauth_* file under /run/user/<uid>/ (used by
+         gdm3, lightdm and other modern display managers).
+    """
+    if os.environ.get("XAUTHORITY"):
+        return  # already set, nothing to do
+
+    try:
+        real_user = os.environ.get("SUDO_USER") or os.getlogin()
+    except OSError:
+        real_user = None
+
+    if not real_user or real_user == "root":
+        return
+
+    # --- 1. Classic ~/.Xauthority ---
+    user_home = os.path.expanduser(f"~{real_user}")
+    xauth_home = os.path.join(user_home, ".Xauthority")
+    if os.path.exists(xauth_home):
+        os.environ["XAUTHORITY"] = xauth_home
+        return
+
+    # --- 2. Modern display-manager path: /run/user/<uid>/xauth_* ---
+    try:
+        import pwd
+        uid = pwd.getpwnam(real_user).pw_uid
+        xauth_run_dir = f"/run/user/{uid}"
+        matches = glob.glob(os.path.join(xauth_run_dir, "xauth_*"))
+        if matches:
+            os.environ["XAUTHORITY"] = matches[0]
+    except (KeyError, ImportError):
+        pass
+
+
+def get_kernel_version() -> tuple[int, ...]:
+    """Return the running kernel version as a (major, minor, patch) tuple."""
+    try:
+        raw = os.uname().release          # e.g. "6.8.0-51-generic"
+        parts = raw.split("-")[0].split(".")
+        return tuple(int(p) for p in parts[:3])
+    except (ValueError, IndexError):
+        return (0, 0, 0)
+
+
+def resolve_primary_atom(display_env: Optional[str]) -> int:
+    """
+    Dynamically resolve the Atom ID for the ``PRIMARY`` string via libX11.
+
+    XA_PRIMARY is guaranteed to be 1 in the X11 protocol, but we resolve it
+    dynamically anyway so the value is always trustworthy even on non-standard
+    or embedded X implementations.  Falls back to the protocol constant (1) if
+    the library cannot be loaded.
+
+    Returns an integer atom value.
+    """
+    FALLBACK = 1  # XA_PRIMARY from <X11/Xatom.h>
+
+    libx11_path = find_libx11()
+    if not libx11_path:
+        return FALLBACK
+
+    env_display = display_env or os.environ.get("DISPLAY", ":0")
+
+    try:
+        libx11 = ctypes.cdll.LoadLibrary(libx11_path)
+
+        # XOpenDisplay(display_name: char*) -> Display*
+        libx11.XOpenDisplay.restype = ctypes.c_void_p
+        libx11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+
+        # XInternAtom(display, name, only_if_exists) -> Atom (unsigned long)
+        libx11.XInternAtom.restype = ctypes.c_ulong
+        libx11.XInternAtom.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
+
+        # XCloseDisplay(display) -> int
+        libx11.XCloseDisplay.restype = ctypes.c_int
+        libx11.XCloseDisplay.argtypes = [ctypes.c_void_p]
+
+        dpy = libx11.XOpenDisplay(env_display.encode())
+        if not dpy:
+            return FALLBACK
+
+        try:
+            atom = libx11.XInternAtom(dpy, b"PRIMARY", 0)
+            return int(atom) if atom else FALLBACK
+        finally:
+            libx11.XCloseDisplay(dpy)
+
+    except OSError:
+        return FALLBACK
+
+
+def find_libx11() -> Optional[str]:
     """
     Return the absolute path of libX11.so.6 on this system.
 
@@ -181,33 +344,44 @@ def find_libx11():
     return None
 
 
-def sync_selection(display_env, verbose):
+def _run(
+    cmd: list[str],
+    env: dict[str, str],
+    stdin_data: Optional[bytes] = None,
+) -> subprocess.CompletedProcess[bytes]:
+    """
+    Run *cmd* as an isolated subprocess and return its output as bytes.
+
+    ``start_new_session=True`` puts the child in its own process group so a
+    hung clipboard tool cannot propagate signals to the daemon or block the
+    worker thread beyond the 2-second timeout.
+    """
+    return subprocess.run(
+        cmd,
+        capture_output=True,
+        timeout=2,
+        env=env,
+        start_new_session=True,
+        input=stdin_data,
+    )
+
+
+def sync_selection(display_env: Optional[str], verbose: bool) -> None:
     """
     Copy the current PRIMARY selection into CLIPBOARD.
 
-    Tries (in order): xclip, xsel, wl-clipboard.
-    Silently ignores errors so a missed sync does not crash the daemon.
+    Tries (in order): xclip, xsel, wl-clipboard.  Each subprocess is
+    launched via :func:`_run` so a stalled tool cannot crash the daemon.
     """
-    env = os.environ.copy()
+    env: dict[str, str] = os.environ.copy()  # type: ignore[assignment]
     if display_env:
         env["DISPLAY"] = display_env
 
     # --- xclip ---
     try:
-        primary = subprocess.run(
-            ["xclip", "-o", "-selection", "primary"],
-            capture_output=True,
-            timeout=2,
-            env=env,
-        )
+        primary = _run(["xclip", "-o", "-selection", "primary"], env)
         if primary.returncode == 0 and primary.stdout.strip():
-            subprocess.run(
-                ["xclip", "-selection", "clipboard"],
-                input=primary.stdout,
-                capture_output=True,
-                timeout=2,
-                env=env,
-            )
+            _run(["xclip", "-selection", "clipboard"], env, primary.stdout)
             if verbose:
                 text = primary.stdout.decode("utf-8", errors="replace").strip()[:60]
                 print(f"  [xclip] synced: {text!r}")
@@ -217,20 +391,9 @@ def sync_selection(display_env, verbose):
 
     # --- xsel ---
     try:
-        primary = subprocess.run(
-            ["xsel", "--primary", "--output"],
-            capture_output=True,
-            timeout=2,
-            env=env,
-        )
+        primary = _run(["xsel", "--primary", "--output"], env)
         if primary.returncode == 0 and primary.stdout.strip():
-            subprocess.run(
-                ["xsel", "--clipboard", "--input"],
-                input=primary.stdout,
-                capture_output=True,
-                timeout=2,
-                env=env,
-            )
+            _run(["xsel", "--clipboard", "--input"], env, primary.stdout)
             if verbose:
                 text = primary.stdout.decode("utf-8", errors="replace").strip()[:60]
                 print(f"  [xsel] synced: {text!r}")
@@ -242,20 +405,9 @@ def sync_selection(display_env, verbose):
     wayland_display = os.environ.get("WAYLAND_DISPLAY") or env.get("WAYLAND_DISPLAY")
     if wayland_display:
         try:
-            primary = subprocess.run(
-                ["wl-paste", "--primary", "--no-newline"],
-                capture_output=True,
-                timeout=2,
-                env=env,
-            )
+            primary = _run(["wl-paste", "--primary", "--no-newline"], env)
             if primary.returncode == 0 and primary.stdout.strip():
-                subprocess.run(
-                    ["wl-copy"],
-                    input=primary.stdout,
-                    capture_output=True,
-                    timeout=2,
-                    env=env,
-                )
+                _run(["wl-copy"], env, primary.stdout)
                 if verbose:
                     text = primary.stdout.decode("utf-8", errors="replace").strip()[:60]
                     print(f"  [wl-clipboard] synced: {text!r}")
@@ -271,16 +423,36 @@ def sync_selection(display_env, verbose):
 # Async sync worker (producer/consumer pattern)
 # ---------------------------------------------------------------------------
 
-def _sync_worker(sync_q, display_env, verbose):
+def _sync_worker(
+    sync_q: queue.Queue[bool],
+    display_env: Optional[str],
+    verbose: bool,
+    stop_event: Optional[threading.Event] = None,
+) -> None:
     """
     Consumer thread: drains the queue and performs the actual clipboard sync.
 
     Debouncing is done here on the consumer side so that rapid-fire events
     are coalesced into a single subprocess invocation.
+
+    The optional ``stop_event`` (threading.Event) allows the main loop to
+    signal a clean shutdown so the worker exits promptly instead of blocking
+    indefinitely on sync_q.get().
     """
     while True:
-        # Block until at least one event is available.
-        sync_q.get()
+        if stop_event is not None:
+            # Use a timeout so we can check stop_event periodically.
+            try:
+                sync_q.get(timeout=0.2)
+            except queue.Empty:
+                if stop_event.is_set():
+                    break
+                continue
+        else:
+            sync_q.get()
+
+        if stop_event is not None and stop_event.is_set():
+            break
 
         # Drain any queued duplicates before doing work.
         while not sync_q.empty():
@@ -299,9 +471,19 @@ def _sync_worker(sync_q, display_env, verbose):
 # Main loop
 # ---------------------------------------------------------------------------
 
-def run(libx11_path, display_env, verbose):
+def run(libx11_path: str, display_env: Optional[str], verbose: bool, primary_atom: int) -> None:
+    """
+    Attach an eBPF uprobe to XSetSelectionOwner() and start the sync loop.
+
+    Automatically selects between the modern ring-buffer backend (kernel >=
+    5.8) and the legacy perf-buffer backend, so the same binary works across
+    all supported kernel versions.
+
+    An ExitStack ensures the eBPF resources and the worker thread stop-event
+    are cleaned up regardless of how the function exits.
+    """
     try:
-        from bcc import BPF  # noqa: import inside function for cleaner error msg
+        from bcc import BPF  # type: ignore[import-untyped]  # no stubs available
     except ImportError:
         print(
             "Error: BCC Python bindings not found.\n"
@@ -310,53 +492,82 @@ def run(libx11_path, display_env, verbose):
         )
         sys.exit(1)
 
-    b = BPF(text=BPF_TEXT)
-    b.attach_uprobe(
-        name=libx11_path,
-        sym="XSetSelectionOwner",
-        fn_name="trace_xset_selection",
-    )
+    kver = get_kernel_version()
+    use_ringbuf = kver >= RINGBUF_MIN_KERNEL
+    if verbose:
+        kver_str = ".".join(str(x) for x in kver)
+        backend = "ring-buffer" if use_ringbuf else "perf-buffer"
+        print(f"Kernel {kver_str} detected – using {backend} backend.")
+        print(f"PRIMARY atom resolved to: {primary_atom}")
+
+    # Fill in the atom value and ring-buffer size at compile time.
+    bpf_src = (BPF_TEXT_RINGBUF if use_ringbuf else BPF_TEXT_PERFBUF)
+    bpf_src = bpf_src.replace("PRIMARY_ATOM_PLACEHOLDER", str(primary_atom))
+    bpf_src = bpf_src.replace("RINGBUF_PAGES_PLACEHOLDER", str(RINGBUF_PAGES))
+
+    stop_event = threading.Event()
+
+    with contextlib.ExitStack() as stack:
+        # --- Compile & load eBPF program ---
+        b = BPF(text=bpf_src)
+        stack.callback(b.cleanup)   # guaranteed cleanup on any exit path
+
+        b.attach_uprobe(  # type: ignore[union-attr]
+            name=libx11_path.encode(),
+            sym=b"XSetSelectionOwner",
+            fn_name=b"trace_xset_selection",
+        )
+
+        if verbose:
+            print(f"Attached eBPF uprobe to XSetSelectionOwner in {libx11_path}")
+
+        # --- Start async sync worker ---
+        # maxsize=1: we only need a "sync needed" signal; if the queue is full
+        # the previous signal hasn't been consumed yet, so we skip (coalesce).
+        sync_q: queue.Queue[bool] = queue.Queue(maxsize=1)
+
+        worker = threading.Thread(
+            target=_sync_worker,
+            args=(sync_q, display_env, verbose, stop_event),
+            daemon=True,
+            name="jucopy-sync-worker",
+        )
+        worker.start()
+        # Signal the worker to stop when we leave the ExitStack context.
+        stack.callback(stop_event.set)
+
+        # --- Wire up perf/ring-buffer callback ---
+        def handle_event(cpu: Any, data: Any, size: Any) -> None:
+            """Callback: enqueue a sync signal (non-blocking)."""
+            event = b["selection_events"].event(data)  # type: ignore[index]
+            if verbose:
+                comm: str = event.comm.decode("utf-8", errors="replace")  # type: ignore[union-attr]
+                print(f"Selection event: pid={event.pid} comm={comm!r}")  # type: ignore[union-attr]
+            try:
+                sync_q.put_nowait(True)
+            except queue.Full:
+                pass  # coalesced
+
+        if use_ringbuf:
+            b["selection_events"].open_ring_buffer(handle_event)  # type: ignore[union-attr]
+        else:
+            b["selection_events"].open_perf_buffer(handle_event)  # type: ignore[union-attr]
+
+        print("jucopy is running – selected text is automatically copied to clipboard.")
+        print("Press Ctrl+C to stop.\n")
+
+        try:
+            while True:
+                if use_ringbuf:
+                    b.ring_buffer_poll(timeout=POLL_TIMEOUT_MS)
+                else:
+                    b.perf_buffer_poll(timeout=POLL_TIMEOUT_MS)
+        except KeyboardInterrupt:
+            pass
+        # ExitStack __exit__ fires here: stop_event.set() then b.cleanup()
 
     if verbose:
-        print(f"Attached eBPF uprobe to XSetSelectionOwner in {libx11_path}")
-
-    # --- Start async sync worker ---
-    # maxsize=1: we only need a "sync needed" signal; if the queue is full
-    # the previous signal hasn't been consumed yet, so we skip (coalesce).
-    sync_q = queue.Queue(maxsize=1)
-    worker = threading.Thread(
-        target=_sync_worker,
-        args=(sync_q, display_env, verbose),
-        daemon=True,
-        name="jucopy-sync-worker",
-    )
-    worker.start()
-
-    def handle_event(cpu, data, size):
-        """Perf-buffer callback: enqueue a sync signal (non-blocking)."""
-        event = b["selection_events"].event(data)
-        if verbose:
-            comm = event.comm.decode("utf-8", errors="replace")
-            print(f"Selection event: pid={event.pid} comm={comm!r}")
-        try:
-            sync_q.put_nowait(True)
-        except queue.Full:
-            # Previous sync still pending — this event is coalesced.
-            pass
-
-    b["selection_events"].open_perf_buffer(handle_event)
-
-    print("jucopy is running – selected text is automatically copied to clipboard.")
-    print("Press Ctrl+C to stop.\n")
-
-    try:
-        while True:
-            b.perf_buffer_poll(timeout=POLL_TIMEOUT_MS)
-    finally:
-        # Explicit cleanup: detach uprobe and free eBPF resources.
-        if verbose:
-            print("Detaching eBPF uprobe...")
-        b.cleanup()
+        print("Detaching eBPF uprobe... done.")
 
 
 def main():
@@ -378,9 +589,19 @@ def main():
     args = parser.parse_args()
 
     check_root()
+
+    # --- Headless / no-X11 node guard ---
+    # Exit gracefully rather than crashing deep inside BCC if no X11 is present.
+    check_x11_environment()
+
+    # --- Fix XAUTHORITY before any X11 subprocess is spawned ---
+    setup_xauth()
+
     check_display(args.display)
 
     libx11 = find_libx11()
+    # find_libx11 is already guaranteed non-None by check_x11_environment(),
+    # but be explicit for clarity.
     if not libx11:
         print(
             "Error: libX11.so.6 not found.\n"
@@ -392,10 +613,13 @@ def main():
     if args.verbose:
         print(f"Found libX11 at: {libx11}")
 
-    try:
-        run(libx11, args.display, args.verbose)
-    except KeyboardInterrupt:
-        print("\nStopping jucopy.")
+    # --- Dynamically resolve PRIMARY atom via libX11 ---
+    primary_atom = resolve_primary_atom(args.display)
+    if args.verbose:
+        print(f"PRIMARY atom ID: {primary_atom}")
+
+    run(libx11, args.display, args.verbose, primary_atom)
+    print("\nStopping jucopy.")
 
 
 if __name__ == "__main__":
