@@ -1,0 +1,16 @@
+[Unit]
+Description=jucopy – eBPF-based clipboard sync (PRIMARY → CLIPBOARD)
+Documentation=https://github.com/zbb88888/jucopy
+After=graphical-session.target
+
+[Service]
+Type=simple
+# ExecStart needs the DISPLAY variable forwarded from the desktop session.
+# Adjust :0 if your session uses a different display number.
+Environment="DISPLAY=:0"
+ExecStart=/usr/local/bin/jucopy --display :0
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target
