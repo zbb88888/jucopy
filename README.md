@@ -77,6 +77,14 @@ Or use the installer:
 ```bash
 sudo bash install.sh
 sudo jucopy
+## Linux Desktop (`linux/`) — Ubuntu 24.04
+
+Monitors the X11 primary selection and syncs it to the clipboard whenever it changes.
+
+### Requirements
+
+```bash
+sudo apt install xclip
 ```
 
 ### Usage
@@ -113,3 +121,10 @@ from the `wl-clipboard` package if it is installed.
 | Clipboard not syncing | Install `xclip`: `sudo apt install xclip` |
 | Permission denied | Run with `sudo` |
 
+```bash
+python3 linux/jucopy.py
+```
+
+### Run at startup
+
+Add the command above to your desktop session **Startup Applications** so it runs automatically when you log in.
