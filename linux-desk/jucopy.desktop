@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=JuCopy
+Comment=Automatically sync PRIMARY selection to CLIPBOARD
+Exec=jucopy-gui
+Icon=jucopy
+Terminal=false
+Categories=Utility;Settings;
+Keywords=clipboard;copy;paste;ebpf;
+StartupNotify=true
