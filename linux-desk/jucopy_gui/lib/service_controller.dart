@@ -10,10 +10,13 @@ enum ServiceStatus {
 }
 
 class ServiceController extends ChangeNotifier {
+  static const refreshInterval = Duration(seconds: 5);
+
   ServiceStatus _status = ServiceStatus.unknown;
   bool _isEnabled = false;
   bool _isChecking = false;
   String _lastError = '';
+  Timer? _refreshTimer;
 
   ServiceStatus get status => _status;
   bool get isEnabled => _isEnabled;
@@ -23,7 +26,13 @@ class ServiceController extends ChangeNotifier {
   ServiceController() {
     refreshStatus();
     // Periodically refresh status
-    Timer.periodic(const Duration(seconds: 5), (_) => refreshStatus());
+    _refreshTimer = Timer.periodic(refreshInterval, (_) => refreshStatus());
+  }
+
+  @override
+  void dispose() {
+    _refreshTimer?.cancel();
+    super.dispose();
   }
 
   Future<void> refreshStatus() async {

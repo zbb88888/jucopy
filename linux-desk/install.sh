@@ -57,7 +57,7 @@ if command -v flutter &>/dev/null; then
     install -m 0644 "${SCRIPT_DIR}/jucopy.desktop" "${DESKTOP_DIR}/jucopy.desktop"
 
     # Optional: Use a system icon if we don't have one
-    sed -i 's/Icon=jucopy/Icon=edit-copy/' "${DESKTOP_DIR}/jucopy.desktop"
+    sed -i 's/^Icon=.*/Icon=edit-copy/' "${DESKTOP_DIR}/jucopy.desktop"
 else
     echo "Warning: flutter not found, skipping GUI build."
 fi

@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:package_info_plus/package_info_plus.dart';
 import 'package:provider/provider.dart';
 import 'package:yaru/yaru.dart';
 import 'service_controller.dart';
@@ -48,19 +49,25 @@ class SettingsPage extends StatelessWidget {
                 style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
               ),
               const SizedBox(height: 16),
-              const YaruSection(
-                headline: Text('Information'),
+              YaruSection(
+                headline: const Text('Information'),
                 child: Column(
                   children: [
-                    ListTile(
+                    const ListTile(
                       title: Text('JuCopy'),
                       subtitle: Text('Automatically sync PRIMARY selection to CLIPBOARD'),
                     ),
-                    ListTile(
-                      title: Text('Version'),
-                      subtitle: Text('1.0.0'),
+                    FutureBuilder<PackageInfo>(
+                      future: PackageInfo.fromPlatform(),
+                      builder: (context, snapshot) {
+                        final version = snapshot.data?.version ?? '...';
+                        return ListTile(
+                          title: const Text('Version'),
+                          subtitle: Text(version),
+                        );
+                      },
                     ),
-                    ListTile(
+                    const ListTile(
                       title: Text('Engine'),
                       subtitle: Text('eBPF (uprobe)'),
                     ),

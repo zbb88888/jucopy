@@ -36,6 +36,7 @@ dependencies:
   cupertino_icons: ^1.0.8
   yaru: ^9.0.1
   provider: ^6.1.5+1
+  package_info_plus: ^9.0.0
 
 dev_dependencies:
   flutter_test:
