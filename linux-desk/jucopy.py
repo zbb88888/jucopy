@@ -38,7 +38,7 @@ POLL_TIMEOUT_MS = 100
 RINGBUF_PAGES = 8
 
 # ---------------------------------------------------------------------------
-# eBPF program (Ring-buffer only)
+# eBPF program (Ring-buffer only, for modern kernels)
 # ---------------------------------------------------------------------------
 
 BPF_TEXT = r"""
@@ -100,6 +100,7 @@ def find_libx11() -> Optional[str]:
     if path and os.path.isabs(path):
         return path
 
+    # 1. Try ldconfig
     try:
         res = subprocess.check_output(["ldconfig", "-p"], text=True, timeout=2)
         for line in res.splitlines():
@@ -107,6 +108,17 @@ def find_libx11() -> Optional[str]:
                 return line.split("=>")[1].strip()
     except: pass
 
+    # 2. Try scanning /proc/*/maps (useful for Snap/Flatpak/non-standard paths)
+    for maps in glob.glob("/proc/[0-9]*/maps"):
+        try:
+            with open(maps, "r") as f:
+                for line in f:
+                    if "libX11.so.6" in line:
+                        p = line.split()[-1]
+                        if os.path.isfile(p): return p
+        except: continue
+
+    # 3. Common multiarch paths
     for p in ["/usr/lib/x86_64-linux-gnu/libX11.so.6", "/usr/lib/aarch64-linux-gnu/libX11.so.6"]:
         if os.path.exists(p): return p
     return None
@@ -154,20 +166,24 @@ def sync_selection(display: str, verbose: bool) -> None:
     env = os.environ.copy()
     env["DISPLAY"] = display
 
+    # helper to run with isolation
+    def _run(cmd, input_data=None):
+        return subprocess.run(cmd, input=input_data, env=env, capture_output=True, timeout=2, start_new_session=True)
+
     # 1. Try xclip
     try:
-        res = subprocess.run(["xclip", "-o", "-selection", "primary"], env=env, capture_output=True, timeout=2)
+        res = _run(["xclip", "-o", "-selection", "primary"])
         if res.returncode == 0 and res.stdout.strip():
-            subprocess.run(["xclip", "-selection", "clipboard"], input=res.stdout, env=env, timeout=2)
+            _run(["xclip", "-selection", "clipboard"], res.stdout)
             if verbose: print(f"  Synced (xclip): {res.stdout.decode(errors='replace')[:50]!r}...")
             return
     except: pass
 
     # 2. Try xsel
     try:
-        res = subprocess.run(["xsel", "--primary", "--output"], env=env, capture_output=True, timeout=2)
+        res = _run(["xsel", "--primary", "--output"])
         if res.returncode == 0 and res.stdout.strip():
-            subprocess.run(["xsel", "--clipboard", "--input"], input=res.stdout, env=env, timeout=2)
+            _run(["xsel", "--clipboard", "--input"], res.stdout)
             if verbose: print(f"  Synced (xsel): {res.stdout.decode(errors='replace')[:50]!r}...")
             return
     except: pass
@@ -175,9 +191,9 @@ def sync_selection(display: str, verbose: bool) -> None:
     # 3. Try wl-clipboard
     if env.get("WAYLAND_DISPLAY"):
         try:
-            res = subprocess.run(["wl-paste", "--primary", "--no-newline"], env=env, capture_output=True, timeout=2)
+            res = _run(["wl-paste", "--primary", "--no-newline"])
             if res.returncode == 0 and res.stdout.strip():
-                subprocess.run(["wl-copy"], input=res.stdout, env=env, timeout=2)
+                _run(["wl-copy"], res.stdout)
                 if verbose: print(f"  Synced (wl-clipboard): {res.stdout.decode(errors='replace')[:50]!r}...")
                 return
         except: pass

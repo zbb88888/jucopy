@@ -53,7 +53,7 @@
 ### 剪贴板同步
 
 - 优先尝试 `xclip`，其次 `xsel`，最后 `wl-clipboard`
-- subprocess 调用设置 2s timeout
+- subprocess 调用设置 2s timeout 并使用 `start_new_session=True` 隔离进程
 
 ### libX11 路径发现
 
@@ -61,7 +61,8 @@
 
 1. `ctypes.util.find_library("X11")`
 2. `ldconfig -p` 显式解析
-3. 硬编码 multiarch 路径
+3. **`/proc/*/maps` 扫描**（适配 Snap/Flatpak/自定义路径）
+4. 硬编码 multiarch 路径
 
 ### 自动修复 XAUTHORITY
 
@@ -74,7 +75,7 @@
 
 ## 依赖
 
-- Linux kernel >= 5.8（Ring-buffer 支持）
+- **Linux kernel >= 5.8**（Ring-buffer 支持）
 - `python3-bpfcc`
 - `libx11-6`
 - `xclip` 或 `xsel`
