@@ -35,7 +35,7 @@ jucopy attaches an **eBPF uprobe** to the `XSetSelectionOwner()` function
 inside `libX11.so.6`.  Every time an X11 or XWayland application claims
 ownership of the PRIMARY selection (i.e. every time the user finishes
 highlighting text), the uprobe fires and a user-space handler immediately
-copies PRIMARY → CLIPBOARD using `xclip`.
+copies PRIMARY → CLIPBOARD.
 
 ```
 highlight text
@@ -46,21 +46,17 @@ XSetSelectionOwner()  ← eBPF uprobe fires
       ▼
 jucopy user-space handler
       │
-      ├─ xclip -o -selection primary
-      │        │
-      └─────── xclip -selection clipboard
+      └─ Sync PRIMARY → CLIPBOARD (via xclip/xsel/wl-clipboard)
 ```
 
 ### Requirements
 
 | Dependency | Package (apt) | Purpose |
 |---|---|---|
-| Linux kernel ≥ 4.14 | *(kernel)* | eBPF support |
+| Linux kernel ≥ 5.8 | *(kernel)* | eBPF Ring-buffer support |
 | BCC Python bindings | `python3-bpfcc` | Compile & load eBPF program |
 | libX11 | `libx11-6` | uprobe target |
 | xclip | `xclip` | Clipboard tool (X11/XWayland) |
-| xsel *(optional)* | `xsel` | Alternative clipboard tool |
-| wl-clipboard *(optional)* | `wl-clipboard` | Wayland PRIMARY sync |
 
 ### Quick start
 
@@ -79,52 +75,20 @@ sudo bash linux-desk/install.sh
 sudo jucopy
 ```
 
-### Usage
-
-```
-sudo python3 linux-desk/jucopy.py [--display DISPLAY] [--verbose]
-
-Options:
-  --display DISPLAY  X11 display (default: $DISPLAY or :0)
-  -v, --verbose      Print each sync event
-```
-
 ### Run as a service
 
 ```bash
-sudo bash linux-desk/install.sh   # installs to /usr/local/bin and /etc/systemd/system/
+sudo bash linux-desk/install.sh
 sudo systemctl enable --now jucopy
 ```
 
-### Wayland
+---
 
-For **XWayland** apps (most apps on Ubuntu 24.04 Wayland sessions), jucopy
-works transparently because they still call `XSetSelectionOwner()`.
+## Legacy Polling Version (`linux/`)
 
-For fully **Wayland-native** apps, jucopy falls back to `wl-paste`/`wl-copy`
-from the `wl-clipboard` package if it is installed.
+A simple polling-based implementation that does NOT require root or eBPF.
+Monitors `xclip -selection primary` every 300ms.
 
-### Troubleshooting
-
-| Symptom | Fix |
-|---|---|
-| `Error: BCC Python bindings not found` | `sudo apt install python3-bpfcc` |
-| `Error: libX11.so.6 not found` | `sudo apt install libx11-6` |
-| Clipboard not syncing | Install `xclip`: `sudo apt install xclip` |
-| Permission denied | Run with `sudo` |
-
-### 内核态过滤器与反馈循环防护
-
-- eBPF 程序新增 `is_sync_tool()` 内联函数，过滤 xclip / xsel / wl-copy / wl-paste 的反馈循环
-- 通过逐字节比较进程名实现，兼容内核版本 ≥ 4.14
-
-### 自动修复 XAUTHORITY
-
-- `sudo` 环境下自动定位 `~/.Xauthority` 或 `/run/user/<uid>/xauth_*`
-- 确保 `xclip` 在无 DISPLAY 的情况下正常工作
-
-### libX11 动态解析
-
-- 优先通过 `/proc/*/maps` 扫描运行中的 X11 进程，获取真实路径
-- 兼容非标准安装路径（如 Flatpak、Snap、自定义 LD_LIBRARY_PATH）
-
+```bash
+python3 linux/jucopy.py
+```

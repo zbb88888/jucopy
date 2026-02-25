@@ -5,12 +5,7 @@ After=graphical-session.target
 
 [Service]
 Type=simple
-# Forward the X11 display and authorisation cookie from the desktop session.
-# Adjust :0 and the XAUTHORITY path to match your display manager if needed.
 Environment="DISPLAY=:0"
-# XAUTHORITY is auto-detected at runtime by jucopy's setup_xauth() helper,
-# but setting it explicitly here avoids any ambiguity under gdm3 / lightdm.
-Environment="XAUTHORITY=/run/user/1000/xauth_XXXXXX"
 ExecStart=/usr/local/bin/jucopy --display :0
 Restart=on-failure
 RestartSec=5
